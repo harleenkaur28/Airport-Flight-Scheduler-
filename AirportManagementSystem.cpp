@@ -9,6 +9,11 @@
 #include <sstream>
 #include <algorithm>
 
+// Add to Flight class:
+static constexpr int TIME_SCALE_FACTOR = 60; // 1 real second = 1 simulated minute
+static constexpr int TAKEOFF_TIME = 300;       // 5 minutes in seconds
+static constexpr int LANDING_TIME = 300;       // 5 minutes in seconds
+
 class Flight
 {
 public:
@@ -32,9 +37,19 @@ struct FlightComparator
 {
     bool operator()(const Flight &f1, const Flight &f2) const
     {
-        if (f1.priority != f2.priority)
-            return f1.priority < f2.priority;       // Higher priority first
-        return f1.scheduledTime > f2.scheduledTime; // Earlier time first
+        // First compare time slots (with some tolerance)
+        auto timeDiff = std::chrono::duration_cast<std::chrono::minutes>(
+                            f1.scheduledTime - f2.scheduledTime)
+                            .count();
+
+        // If flights are within same 5-minute slot, use priority
+        if (std::abs(timeDiff) <= 5)
+        {
+            return f1.priority < f2.priority; // Higher priority first
+        }
+
+        // Otherwise, earlier time first
+        return f1.scheduledTime > f2.scheduledTime;
     }
 };
 
@@ -131,8 +146,13 @@ private:
         {
             std::unique_lock<std::mutex> queueLock(queueMutex);
 
-            queueCV.wait(queueLock, [this]()
-                         { return !flightQueue.empty() || isShutdown; });
+            auto now = std::chrono::system_clock::now();
+
+            queueCV.wait(queueLock, [this, now]()
+                         {
+            if (flightQueue.empty()) return isShutdown;
+            const Flight& nextFlight = flightQueue.top();
+            return isShutdown || nextFlight.scheduledTime <= now; });
 
             if (isShutdown && flightQueue.empty())
             {
@@ -143,24 +163,34 @@ private:
             if (!flightQueue.empty())
             {
                 Flight flight = flightQueue.top();
-                flightQueue.pop();
-                queueLock.unlock();
 
-                std::stringstream msg;
-                msg << "Runway " << runwayId << " processing "
-                    << flight.type << " flight " << flight.id
-                    << " (Priority: " << flight.priority << ")";
-                printMessage(msg.str());
+                if (flight.scheduledTime <= now || isShutdown)
+                {
+                    flightQueue.pop();
+                    queueLock.unlock();
 
-                // Simulate processing time
-                std::this_thread::sleep_for(std::chrono::seconds(2));
+                    std::stringstream msg;
+                    msg << "Runway " << runwayId << " processing "
+                        << flight.type << " flight " << flight.id
+                        << " (Priority: " << flight.priority << ")";
+                    printMessage(msg.str());
 
-                runways[runwayId - 1].release();
+                    // Simulate with scaled time
+                    int processingTime = (flight.type == "takeoff" ? TAKEOFF_TIME : LANDING_TIME) / TIME_SCALE_FACTOR;
 
-                msg.str("");
-                msg << "Flight " << flight.id
-                    << " completed processing on runway " << runwayId;
-                printMessage(msg.str());
+                    std::this_thread::sleep_for(
+                        std::chrono::seconds(processingTime));
+
+                    runways[runwayId - 1].release();
+
+                    msg.str("");
+                    msg << "Flight " << flight.id
+                        << " completed " << flight.type
+                        << " on runway " << runwayId
+                        << " (Simulated " << (processingTime * TIME_SCALE_FACTOR)
+                        << " seconds)";
+                    printMessage(msg.str());
+                }
             }
         }
     }
