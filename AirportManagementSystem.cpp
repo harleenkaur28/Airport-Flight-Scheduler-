@@ -1,215 +1,246 @@
 #include <iostream>
 #include <vector>
+#include <queue>
 #include <thread>
-#include <chrono>
 #include <mutex>
 #include <condition_variable>
-#include <queue>
-#include <optional>
+#include <chrono>
+#include <iomanip>
+#include <sstream>
+#include <algorithm>
 
-std::condition_variable cv;
-
-class Flight {
+class Flight
+{
 public:
     int id;
-    std::string type; // "arrival" or "departure"
+    std::string type;
     int priority;
-    std::string time;
-    std::string status; // "waiting", "assigned", "landed"
+    std::chrono::system_clock::time_point scheduledTime;
+    std::string status;
 
-    Flight(int id, const std::string& type, int priority, const std::string& time)
-        : id(id), type(type), priority(priority), time(time), status("waiting") {}
+    Flight(int id, const std::string &type, int priority, const std::string &timeStr)
+        : id(id), type(type), priority(priority), status("waiting")
+    {
+        std::tm tm = {};
+        std::istringstream ss(timeStr);
+        ss >> std::get_time(&tm, "%H:%M");
+        scheduledTime = std::chrono::system_clock::from_time_t(std::mktime(&tm));
+    }
 };
 
-class Runway {
+struct FlightComparator
+{
+    bool operator()(const Flight &f1, const Flight &f2) const
+    {
+        if (f1.priority != f2.priority)
+            return f1.priority < f2.priority;       // Higher priority first
+        return f1.scheduledTime > f2.scheduledTime; // Earlier time first
+    }
+};
+
+class Runway
+{
 public:
     int id;
     bool isAvailable;
-    Flight* currentFlight;
+    std::mutex mutex;
+    std::condition_variable cv;
 
-    Runway(int id) : id(id), isAvailable(true), currentFlight(nullptr) {}
+    // Default constructor
+    Runway() : id(0), isAvailable(true) {}
 
-    // Delete copy constructor and copy assignment operator
-    Runway(const Runway&) = delete;
-    Runway& operator=(const Runway&) = delete;
+    // Constructor with id
+    explicit Runway(int runwayId) : id(runwayId), isAvailable(true) {}
 
-    // Allow move constructor and move assignment
-    Runway(Runway&& other) noexcept : id(other.id), isAvailable(other.isAvailable),
-                                      currentFlight(other.currentFlight) {
-        other.currentFlight = nullptr; // Invalidate the moved-from object
+    // Copy constructor
+    Runway(const Runway &other) : id(other.id), isAvailable(other.isAvailable) {}
+
+    // Move constructor
+    Runway(Runway &&other) noexcept
+        : id(other.id), isAvailable(other.isAvailable)
+    {
+        other.id = 0;
+        other.isAvailable = false;
     }
 
-    Runway& operator=(Runway&& other) noexcept {
-        if (this != &other) {
+    // Copy assignment operator
+    Runway &operator=(const Runway &other)
+    {
+        if (this != &other)
+        {
             id = other.id;
             isAvailable = other.isAvailable;
-            currentFlight = other.currentFlight;
-            other.currentFlight = nullptr; // Invalidate the moved-from object
         }
         return *this;
     }
 
-    bool assignFlight(Flight* flight) {
-        std::lock_guard<std::mutex> lock(runwayMutex);
-        if (isAvailable) {
-            currentFlight = flight;
-            isAvailable = false; // Mark the runway as occupied
-            return true; // Flight assigned successfully
-        }
-        return false; // Runway is not available
-    }
-
-    void releaseAfterDelay(int seconds) {
-        std::this_thread::sleep_for(std::chrono::seconds(seconds));
+    // Move assignment operator
+    Runway &operator=(Runway &&other) noexcept
+    {
+        if (this != &other)
         {
-            std::lock_guard<std::mutex> lock(runwayMutex);
-            isAvailable = true;
-            currentFlight = nullptr;
+            id = other.id;
+            isAvailable = other.isAvailable;
+            other.id = 0;
+            other.isAvailable = false;
         }
-        cv.notify_one(); // Notify the waiting thread immediately
-        std::cout << "Runway " << id << " is now available." << std::endl;
+        return *this;
     }
 
+    bool assignFlight(Flight &flight)
+    {
+        std::lock_guard<std::mutex> lock(mutex);
+        if (isAvailable)
+        {
+            isAvailable = false;
+            return true;
+        }
+        return false;
+    }
+
+    void release()
+    {
+        std::lock_guard<std::mutex> lock(mutex);
+        isAvailable = true;
+        cv.notify_one();
+    }
+};
+class AirportManager
+{
 private:
-    std::mutex runwayMutex;
+    std::vector<Runway> runways;
+    std::priority_queue<Flight, std::vector<Flight>, FlightComparator> flightQueue;
+    std::mutex queueMutex;
+    std::condition_variable queueCV;
+    bool isShutdown;
+    std::mutex outputMutex;
+
+    // Helper function for formatted output
+    void printMessage(const std::string &message)
+    {
+        std::lock_guard<std::mutex> lock(outputMutex);
+        auto now = std::chrono::system_clock::now();
+        auto time = std::chrono::system_clock::to_time_t(now);
+        std::cout << "[" << std::put_time(std::localtime(&time), "%H:%M:%S") << "] "
+                  << message << std::endl; // std::endl flushes the output
+    }
+
+    void processRunway(int runwayId)
+    {
+        while (true)
+        {
+            std::unique_lock<std::mutex> queueLock(queueMutex);
+
+            queueCV.wait(queueLock, [this]()
+                         { return !flightQueue.empty() || isShutdown; });
+
+            if (isShutdown && flightQueue.empty())
+            {
+                printMessage("Runway " + std::to_string(runwayId) + " shutting down.");
+                break;
+            }
+
+            if (!flightQueue.empty())
+            {
+                Flight flight = flightQueue.top();
+                flightQueue.pop();
+                queueLock.unlock();
+
+                std::stringstream msg;
+                msg << "Runway " << runwayId << " processing "
+                    << flight.type << " flight " << flight.id
+                    << " (Priority: " << flight.priority << ")";
+                printMessage(msg.str());
+
+                // Simulate processing time
+                std::this_thread::sleep_for(std::chrono::seconds(2));
+
+                runways[runwayId - 1].release();
+
+                msg.str("");
+                msg << "Flight " << flight.id
+                    << " completed processing on runway " << runwayId;
+                printMessage(msg.str());
+            }
+        }
+    }
+
+public:
+    AirportManager(int numRunways) : isShutdown(false)
+    {
+        for (int i = 0; i < numRunways; ++i)
+        {
+            runways.emplace_back(i + 1);
+        }
+    }
+
+    void addFlight(const Flight &flight)
+    {
+        std::lock_guard<std::mutex> lock(queueMutex);
+        flightQueue.push(flight);
+        queueCV.notify_one();
+    }
+
+    void start()
+    {
+        std::vector<std::thread> runwayThreads;
+
+        printMessage("Airport Management System starting...");
+        printMessage("Number of active runways: " + std::to_string(runways.size()));
+
+        for (size_t i = 0; i < runways.size(); ++i)
+        {
+            runwayThreads.emplace_back(&AirportManager::processRunway, this, i + 1);
+        }
+
+        printMessage("Press Enter to shutdown the airport system...");
+        std::cin.get();
+
+        // Initiate shutdown
+        {
+            std::lock_guard<std::mutex> lock(queueMutex);
+            isShutdown = true;
+            queueCV.notify_all();
+        }
+
+        printMessage("Initiating shutdown sequence...");
+
+        // Wait for all runway threads to complete
+        for (auto &thread : runwayThreads)
+        {
+            thread.join();
+        }
+
+        printMessage("Airport Management System shutdown complete.");
+    }
 };
 
-std::vector<Runway> runways;
-std::mutex flightsMutex;
-
-std::queue<Flight> preemptedFlights;
-std::queue<Flight> regularFlights;
-
-std::mutex runwayMutex;
-std::condition_variable runwayAvailableCV;
-void assignLanding(Flight& flight) {
-    std::unique_lock<std::mutex> lock(runwayMutex);
-    
-    for (auto& runway : runways) {
-        if (runway.isAvailable) {
-            runway.isAvailable = false;
-            std::cout << "Landing Flight ID: " << flight.id << " assigned to runway " << runway.id << "." << std::endl;
-            lock.unlock();
-            
-            // Simulate landing time
-            std::this_thread::sleep_for(std::chrono::seconds(2));
-
-            // Mark runway as available
-            lock.lock();
-            runway.isAvailable = true;
-            std::cout << "Runway " << runway.id << " is now available." << std::endl;
-            
-            // Notify checkWaitingFlights about the availability
-            runwayAvailableCV.notify_one();
-            break;
-        }
-    }
-}
-
-
-void checkWaitingFlights() {
-    while (true) {
-        std::unique_lock<std::mutex> lock(runwayMutex);
-        
-        // Wait for a runway to become available if all are occupied
-        runwayAvailableCV.wait(lock, [] {
-            for (const auto& runway : runways) {
-                if (runway.isAvailable) return true;
-            }
-            return false;
-        });
-
-        // Check and assign any waiting flights
-        if (!preemptedFlights.empty()) {
-            Flight flight = preemptedFlights.front();
-            preemptedFlights.pop();
-            assignLanding(flight); // This will assign a free runway to the flight
-        } else if (!regularFlights.empty()) {
-            Flight flight = regularFlights.front();
-            regularFlights.pop();
-            assignLanding(flight);
-        }
-
-        // Break if no more flights are in the queues and all runways are free
-        if (preemptedFlights.empty() && regularFlights.empty()) {
-            bool allRunwaysFree = true;
-            for (const auto& runway : runways) {
-                if (!runway.isAvailable) {
-                    allRunwaysFree = false;
-                    break;
-                }
-            }
-            if (allRunwaysFree) break;
-        }
-    }
-}
-int main() {
+int main()
+{
     int numRunways, numFlights;
-    std::cout << "Enter the number of runways: ";
+
+    std::cout << "Enter number of runways: ";
     std::cin >> numRunways;
+    std::cin.ignore();
 
-    // Initialize the runways
-    for (int i = 0; i < numRunways; ++i) {
-        runways.emplace_back(i + 1); // Runway IDs start from 1
-    }
+    AirportManager airport(numRunways);
 
-    std::cout << "Enter the number of flights: ";
+    std::cout << "Enter number of flights: ";
     std::cin >> numFlights;
-    std::vector<Flight> flights;
+    std::cin.ignore();
 
-    // Input flight details
-    for (int i = 0; i < numFlights; ++i) {
+    for (int i = 0; i < numFlights; ++i)
+    {
         int id, priority;
         std::string type, time;
-        std::cout << "Enter flight ID, type (arrival/departure), priority, and time: ";
+
+        std::cout << "Enter flight details (ID Type[arrival/departure] Priority Time[HH:MM]): ";
         std::cin >> id >> type >> priority >> time;
 
         Flight flight(id, type, priority, time);
-        flights.push_back(flight);
+        airport.addFlight(flight);
     }
 
-    // Launch a thread to monitor and handle waiting flights
-    std::thread monitorThread(checkWaitingFlights);
-
-    // Process each flight based on type
-    std::vector<std::thread> flightThreads; // Store threads for each flight to handle concurrency
-
-    for (auto& flight : flights) {
-        if (flight.type == "arrival") {
-            // Assign landing using a thread for each flight
-            flightThreads.emplace_back(assignLanding, std::ref(flight));
-        } else if (flight.type == "departure") {
-            // Placeholder for departure handling logic
-            flightThreads.emplace_back([](Flight f) {
-                std::cout << "Takeoff Flight ID: " << f.id << " assigned to runway (to be implemented)." << std::endl;
-                // Departure handling logic can go here
-            }, flight);
-        }
-    }
-
-    // Wait for all flight assignment threads to finish
-    for (auto& th : flightThreads) {
-        if (th.joinable()) th.join();
-    }
-
-    // Signal the monitor thread to stop checking once all flights are processed
-    monitorThread.join();
-
-    // Check if all runways are available and queues are empty before exiting
-    while (true) {
-        bool allFree = true;
-        for (const auto& runway : runways) {
-            if (!runway.isAvailable) {
-                allFree = false;
-                break;
-            }
-        }
-
-        if (preemptedFlights.empty() && regularFlights.empty() && allFree) {
-            std::cout << "All flights have landed or taken off. Exiting system." << std::endl;
-            break;
-        }
-    }
-
+    airport.start();
     return 0;
 }
