@@ -20,28 +20,31 @@ public:
     int id;
     std::string type;
     int priority;
-    std::chrono::system_clock::time_point scheduledTime;
+    // std::chrono::system_clock::time_point scheduledTime;
+    int timeInMinutes;
     std::string status;
 
     Flight(int id, const std::string &type, int priority, const std::string &timeStr)
         : id(id), type(type), priority(priority), status("waiting")
     {
-        std::tm tm = {};
-        std::istringstream ss(timeStr);
-        ss >> std::get_time(&tm, "%H:%M");
-        scheduledTime = std::chrono::system_clock::from_time_t(std::mktime(&tm));
+        int hours, minutes;
+        sscanf(timeStr.c_str(), "%d:%d", &hours, &minutes);
+        // std::tm tm = {};
+        // std::istringstream ss(timeStr);
+        // ss >> std::get_time(&tm, "%H:%M");
+        // scheduledTime = std::chrono::system_clock::from_time_t(std::mktime(&tm));
+        timeInMinutes = hours * 60 + minutes;
     }
 };
 
 struct FlightComparator
 {
+    
     bool operator()(const Flight &f1, const Flight &f2) const
     {
         // First compare time slots (with some tolerance)
-        auto timeDiff = std::chrono::duration_cast<std::chrono::minutes>(
-                            f1.scheduledTime - f2.scheduledTime)
-                            .count();
-
+       int timeDiff = std::abs(f1.timeInMinutes - f2.timeInMinutes);
+        std::cout << timeDiff <<  std::endl;
         // If flights are within same 5-minute slot, use priority
         if (std::abs(timeDiff) <= 5)
         {
@@ -49,7 +52,7 @@ struct FlightComparator
         }
 
         // Otherwise, earlier time first
-        return f1.scheduledTime > f2.scheduledTime;
+        return f1.timeInMinutes > f2.timeInMinutes;
     }
 };
 
@@ -152,7 +155,8 @@ private:
                          {
             if (flightQueue.empty()) return isShutdown;
             const Flight& nextFlight = flightQueue.top();
-            return isShutdown || nextFlight.scheduledTime <= now; });
+            // return isShutdown || nextFlight.timeInMinutes <= now; });
+            return isShutdown;});
 
             if (isShutdown && flightQueue.empty())
             {
@@ -164,7 +168,8 @@ private:
             {
                 Flight flight = flightQueue.top();
 
-                if (flight.scheduledTime <= now || isShutdown)
+                // if (flight.scheduledTime <= now || isShutdown)
+                if (isShutdown)
                 {
                     flightQueue.pop();
                     queueLock.unlock();
